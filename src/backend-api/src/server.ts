@@ -67,43 +67,6 @@ const playtimeFile = '/tmp/playtime.json'
 const dataLock = '/tmp/.data.lock'
 const resumeLock = '/tmp/.resume.lock'
 
-// Maximum age (ms) of a lock file before it's considered stale and reclaimable.
-// A write+release cycle is sub-second in practice; 30s gives a generous margin
-// for SD-card stalls and busy-system schedules while still recovering before
-// the next user action.
-const LOCK_STALE_MS = 30_000
-
-// AR5-6: proactively clear any lock file left behind by a previous pm2 crash.
-// Without this, a mid-write crash leaves /tmp/.data.lock or /tmp/.resume.lock
-// on disk forever, and every subsequent /api/add|edit|delete|addresume|
-// deleteresume hits the `locked` branch until the box reboots. The
-// acquireLock helper below also handles stale locks at acquisition time, but
-// this start-up pass keeps the file system tidy and surfaces the cleanup in
-// the boot logs.
-;[dataLock, resumeLock].forEach((lockPath) => {
-  try {
-    const stat = fs.statSync(lockPath)
-    const ageMs = Date.now() - stat.mtimeMs
-    if (ageMs > LOCK_STALE_MS) {
-      fs.unlinkSync(lockPath)
-      console.warn(
-        `${new Date().toLocaleString()}: [MuPiBox-Server] startup: removed stale lock ${lockPath} (age ${Math.round(ageMs / 1000)}s)`,
-      )
-    } else {
-      console.warn(
-        `${new Date().toLocaleString()}: [MuPiBox-Server] startup: leaving lock ${lockPath} in place (age ${Math.round(ageMs / 1000)}s, < ${LOCK_STALE_MS / 1000}s)`,
-      )
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.error(
-        `${new Date().toLocaleString()}: [MuPiBox-Server] startup: error inspecting ${lockPath}:`,
-        err,
-      )
-    }
-  }
-})
-
 let mupiboxConfigCache: MupiboxConfig | undefined
 let mupiboxConfigLoadPromise: Promise<MupiboxConfig | undefined> | null = null
 
@@ -610,13 +573,15 @@ app.post('/api/addwlan', (req, res) => {
 })
 
 app.post('/api/add', (req, res) => {
-  const lockResult = acquireLock(dataLock, '/api/add')
-  if (lockResult === 'locked') {
+  if (fs.existsSync(dataLock)) {
     console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/add data.json is locked`)
     res.status(200).send('locked')
     return
   }
-  if (lockResult === 'error') {
+  try {
+    fs.openSync(dataLock, 'w')
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/add failed to acquire lock:`, err)
     res.status(200).send('error')
     return
   }
@@ -640,66 +605,6 @@ app.post('/api/add', (req, res) => {
     })
   })
 })
-
-// Lock acquisition — atomic test-and-set on a lock file using O_EXCL | O_CREAT
-// (Node's 'wx' flag). The historical pattern was `if (existsSync) ...; openSync(..., 'w')`
-// which had two problems:
-//   M8: 'w' truncates the existing file instead of failing, so the openSync
-//        side never actually fails — the "lock" was just a marker file that
-//        relied on existsSync + releaseLock cooperating.
-//   M8 race: between existsSync and openSync another worker could win the
-//            race, both threads would think they hold the lock.
-// 'wx' = O_CREAT | O_EXCL: atomic create-or-fail. EEXIST means somebody else
-// holds it.
-//
-// AR5-6 stale-lock recovery: if EEXIST and the lock is older than LOCK_STALE_MS,
-// the owner almost certainly crashed before releasing — steal it once and try
-// again. A startup pass (see top of file) already does this proactively, but
-// recovery at acquisition time covers crashes that happen after startup.
-const acquireLock = (lockPath: string, context: string): 'acquired' | 'locked' | 'error' => {
-  const tryOpen = (): 'acquired' | 'exists' | 'error' => {
-    try {
-      fs.closeSync(fs.openSync(lockPath, 'wx'))
-      return 'acquired'
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code
-      if (code === 'EEXIST') return 'exists'
-      console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] ${context} failed to acquire lock:`, err)
-      return 'error'
-    }
-  }
-  const first = tryOpen()
-  if (first !== 'exists') return first
-  // EEXIST: check whether the existing lock is stale.
-  try {
-    const stat = fs.statSync(lockPath)
-    const ageMs = Date.now() - stat.mtimeMs
-    if (ageMs > LOCK_STALE_MS) {
-      console.warn(
-        `${new Date().toLocaleString()}: [MuPiBox-Server] ${context} found stale lock (age ${Math.round(ageMs / 1000)}s), reclaiming`,
-      )
-      try {
-        fs.unlinkSync(lockPath)
-      } catch (unlinkErr) {
-        if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
-          console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] ${context} stale-lock unlink failed:`, unlinkErr)
-          return 'error'
-        }
-      }
-      const retry = tryOpen()
-      return retry === 'exists' ? 'locked' : retry
-    }
-  } catch (statErr) {
-    if ((statErr as NodeJS.ErrnoException).code === 'ENOENT') {
-      // Lock disappeared between our open attempt and the stat — race with a
-      // worker that just released. Try once more.
-      const retry = tryOpen()
-      return retry === 'exists' ? 'locked' : retry
-    }
-    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] ${context} stale-lock stat failed:`, statErr)
-  }
-  return 'locked'
-}
 
 // Lock cleanup — used by every read-modify-write endpoint (data.json + resume.json)
 // to ensure the lock is always removed once the read+write cycle has finished
@@ -725,44 +630,6 @@ const resumeKeyOf = (m: { type?: string; id?: string; playlistid?: string; showi
     m?.type || '',
     m?.playlistid || m?.showid || m?.audiobookid || m?.id || `${m?.artist || ''}::${m?.title || ''}`,
   ].join('|')
-
-// AR5-18: when mplayer fires playlist-finish, backend-player POSTs
-// /api/deleteresume to remove the now-completed album from the resume list.
-// At the same instant the frontend's player page notices the playback ended
-// and POSTs /api/addresume to save "where we last were". The file lock here
-// serialises the two writes, but the order is non-deterministic: if
-// addresume wins after deleteresume, the resume entry gets resurrected and
-// the kid is offered "weiterhören" at the very last second of an album that
-// just finished — defeating the whole point of deleteresume on playlist-end.
-//
-// Mitigation: track recently-deleted composite keys for a short rejection
-// window. While a key is in this map, an addresume for that key is silently
-// skipped (still 200 ok). 2.5s comfortably covers the worst case: mplayer
-// playlist-finish → backend-player HTTP → /api/deleteresume → frontend
-// observes paused state → /api/addresume, with SD-induced delays.
-const RESUME_REJECT_AFTER_DELETE_MS = 2500
-const recentResumeDeletes = new Map<string, number>()
-const noteResumeDeleted = (key: string) => {
-  recentResumeDeletes.set(key, Date.now())
-}
-const wasResumeJustDeleted = (key: string): boolean => {
-  const stamp = recentResumeDeletes.get(key)
-  if (stamp === undefined) return false
-  if (Date.now() - stamp > RESUME_REJECT_AFTER_DELETE_MS) {
-    recentResumeDeletes.delete(key)
-    return false
-  }
-  return true
-}
-// Tidy the map every minute so a long-running backend doesn't accumulate
-// keys forever. Lookups already self-expire, but stale entries hold memory
-// until they're looked up — a periodic sweep bounds the worst case.
-setInterval(() => {
-  const cutoff = Date.now() - RESUME_REJECT_AFTER_DELETE_MS
-  for (const [k, t] of recentResumeDeletes) {
-    if (t < cutoff) recentResumeDeletes.delete(k)
-  }
-}, 60_000).unref?.()
 
 // Back-fill lastPlayedAt for legacy resume entries that pre-date the field.
 // Reasoning: the previous addresume implementation did update-in-place when
@@ -821,30 +688,21 @@ const readResumeOrRecover = (context: string, cb: (data: any[]) => void) => {
 }
 
 app.post('/api/addresume', (req, res) => {
-  const lockResult = acquireLock(resumeLock, '/api/addresume')
-  if (lockResult === 'locked') {
+  if (fs.existsSync(resumeLock)) {
     console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/addresume resume.json is locked`)
     res.status(200).send('locked')
     return
   }
-  if (lockResult === 'error') {
+  try {
+    fs.openSync(resumeLock, 'w')
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/addresume failed to acquire lock:`, err)
     res.status(200).send('error')
     return
   }
   readResumeOrRecover('/api/addresume', (data) => {
     const now = Date.now()
     const incomingKey = resumeKeyOf(req.body)
-    // AR5-18: if backend-player just told us this album finished naturally
-    // (POST /api/deleteresume within the last RESUME_REJECT_AFTER_DELETE_MS),
-    // refuse to recreate the entry that the frontend's paused-state observer
-    // is now racing to save. Respond ok so the frontend doesn't treat the
-    // skip as a failure.
-    if (wasResumeJustDeleted(incomingKey)) {
-      releaseLock(resumeLock, '/api/addresume')
-      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/addresume skipped (key=${incomingKey} was just deleted on playlist-finish).`)
-      res.status(200).send('ok')
-      return
-    }
     backfillLastPlayedAt(data, now)
     // Always stamp the incoming entry — it was just played now, so it
     // should sort to position 1 on the resume page after frontend's
@@ -877,22 +735,20 @@ app.post('/api/addresume', (req, res) => {
 // fields matter — type + one of playlistid/showid/audiobookid/id, or
 // artist::title as a fallback). Idempotent: if no entry matches, 200 ok.
 app.post('/api/deleteresume', (req, res) => {
-  const lockResult = acquireLock(resumeLock, '/api/deleteresume')
-  if (lockResult === 'locked') {
+  if (fs.existsSync(resumeLock)) {
     console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/deleteresume resume.json is locked`)
     res.status(200).send('locked')
     return
   }
-  if (lockResult === 'error') {
+  try {
+    fs.openSync(resumeLock, 'w')
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/deleteresume failed to acquire lock:`, err)
     res.status(200).send('error')
     return
   }
   readResumeOrRecover('/api/deleteresume', (data) => {
     const targetKey = resumeKeyOf(req.body)
-    // AR5-18: even if no entry matched (idempotent path), still mark the
-    // key as recently-deleted. The race window covers the frontend's
-    // pending addresume regardless of whether anything was on disk yet.
-    noteResumeDeleted(targetKey)
     const remaining = data.filter((item: any) => resumeKeyOf(item) !== targetKey)
     if (remaining.length === data.length) {
       releaseLock(resumeLock, '/api/deleteresume')
@@ -916,13 +772,15 @@ app.post('/api/deleteresume', (req, res) => {
 })
 
 app.post('/api/delete', (req, res) => {
-  const lockResult = acquireLock(dataLock, '/api/delete')
-  if (lockResult === 'locked') {
+  if (fs.existsSync(dataLock)) {
     console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/delete data.json is locked`)
     res.status(200).send('locked')
     return
   }
-  if (lockResult === 'error') {
+  try {
+    fs.openSync(dataLock, 'w')
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/delete failed to acquire lock:`, err)
     res.status(200).send('error')
     return
   }
@@ -948,13 +806,15 @@ app.post('/api/delete', (req, res) => {
 })
 
 app.post('/api/edit', (req, res) => {
-  const lockResult = acquireLock(dataLock, '/api/edit')
-  if (lockResult === 'locked') {
+  if (fs.existsSync(dataLock)) {
     console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/edit data.json is locked`)
     res.status(200).send('locked')
     return
   }
-  if (lockResult === 'error') {
+  try {
+    fs.openSync(dataLock, 'w')
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/edit failed to acquire lock:`, err)
     res.status(200).send('error')
     return
   }
