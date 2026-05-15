@@ -7,7 +7,7 @@ import { LogService } from './log.service'
 import type { CategoryType, Media } from './media'
 import { SpotifyConfig } from './spotify'
 import { SpotifyPlayerService } from './spotify-player.service'
-import { ExtraDataMedia, Utils } from './utils'
+import { ExtraDataMedia, localizeCoverUrl, Utils } from './utils'
 
 @Injectable({
   providedIn: 'root',
@@ -177,7 +177,7 @@ export class SpotifyService {
             id: album.id,
             artist: album.artists?.[0]?.name || 'Unknown Artist',
             title: album.name,
-            cover: album.images?.[0]?.url || '../assets/images/nocover_mupi.png',
+            cover: localizeCoverUrl(album.images?.[0]?.url),
             release_date: album.release_date,
             type: 'spotify',
             category,
@@ -208,7 +208,7 @@ export class SpotifyService {
 
     return this.http.get<any>(artistUrl).pipe(
       switchMap((artist) => {
-        const artistcover = artist.images?.[0]?.url || '../assets/images/nocover_mupi.png'
+        const artistcover = localizeCoverUrl(artist.images?.[0]?.url)
 
         return this.fetchAllPaginatedResults<any>(artistAlbumsUrl, {}).pipe(
           map((albums) => {
@@ -217,7 +217,7 @@ export class SpotifyService {
                 id: album.id,
                 artist: album.artists?.[0]?.name || 'Unknown Artist',
                 title: album.name,
-                cover: album.images?.[0]?.url || '../assets/images/nocover_mupi.png',
+                cover: localizeCoverUrl(album.images?.[0]?.url),
                 artistcover: artistcover,
                 release_date: album.release_date,
                 type: 'spotify',
@@ -252,7 +252,7 @@ export class SpotifyService {
     return this.http.get<any>(showUrl).pipe(
       switchMap((show) => {
         const showName = show.name || 'Unknown Show'
-        const showcover = show.images?.[0]?.url || '../assets/images/nocover_mupi.png'
+        const showcover = localizeCoverUrl(show.images?.[0]?.url)
 
         return this.fetchAllPaginatedResults<any>(showEpisodesUrl, {}).pipe(
           map((episodes) => {
@@ -263,7 +263,7 @@ export class SpotifyService {
                   showid: episode.id,
                   artist: showName,
                   title: episode.name,
-                  cover: episode.images?.[0]?.url || showcover,
+                  cover: episode.images?.[0]?.url ? localizeCoverUrl(episode.images[0].url) : showcover,
                   artistcover: showcover,
                   type: 'spotify',
                   category,
@@ -304,7 +304,7 @@ export class SpotifyService {
           id: album.id,
           artist: album.artists?.[0]?.name || 'Unknown Artist',
           title: album.name,
-          cover: album.images?.[0]?.url || '../assets/images/nocover_mupi.png',
+          cover: localizeCoverUrl(album.images?.[0]?.url),
           type: 'spotify',
           release_date: album.release_date,
           category,
@@ -356,7 +356,7 @@ export class SpotifyService {
           audiobookid: audiobook.id,
           artist: audiobook.authors?.[0]?.name || 'Unknown Author',
           title: audiobook.name,
-          cover: audiobook.images?.[0]?.url || '../assets/images/nocover_mupi.png',
+          cover: localizeCoverUrl(audiobook.images?.[0]?.url),
           type: 'spotify',
           category,
           index,
@@ -407,7 +407,7 @@ export class SpotifyService {
           showid: episode.id,
           artist: episode.show?.[0]?.name || 'Unknown Show',
           title: episode.name,
-          cover: episode.images?.[0]?.url || '../assets/images/nocover_mupi.png',
+          cover: localizeCoverUrl(episode.images?.[0]?.url),
           type: 'spotify',
           release_date: episode.release_date,
           category,
@@ -467,7 +467,7 @@ export class SpotifyService {
         const media: Media = {
           playlistid: isFromBackend ? id : response.id,
           title: isFromBackend ? response.playlist.name : response.name,
-          cover: isFromBackend ? response.playlist.images?.[0]?.url : response?.images?.[0]?.url,
+          cover: localizeCoverUrl(isFromBackend ? response.playlist.images?.[0]?.url : response?.images?.[0]?.url),
           type: 'spotify',
           category,
           index,
