@@ -10,6 +10,7 @@ import ky from 'ky'
 import xmlparser from 'xml-js'
 import { LogRequest, LogResponse } from './models/log.model'
 import type { MupiboxConfig } from './models/mupibox-config.model'
+import type { PlaytimeStatus } from './models/playtime.model'
 import { ServerConfig } from './models/server.model'
 import type { SpotifyValidationRequest, SpotifyValidationResponse } from './models/spotify-api.model'
 import { SpotifyApiService } from './services/spotify-api.service'
@@ -62,6 +63,7 @@ const wlanFile = `${configBasePath}/wlan.json`
 const monitorFile = `${configBasePath}/monitor.json`
 const albumstopFile = `${configBasePath}/albumstop.json`
 const mupihat = '/tmp/mupihat.json'
+const playtimeFile = '/tmp/playtime.json'
 const dataLock = '/tmp/.data.lock'
 const resumeLock = '/tmp/.resume.lock'
 
@@ -139,6 +141,44 @@ if (productionServe) {
   app.use(express.static(path.join(__dirname, 'www')))
 }
 
+// MED-2: harden /api/rssfeed against SSRF.
+//
+// The endpoint takes a user-supplied URL and ky-fetches it server-side,
+// so a caller can pivot the box into reaching anything routable from
+// the box's network — most notably the LAN's internal services
+// (router admin pages, NAS shares, other boxes' admin UIs). The
+// endpoint itself is auth-protected (frontend only), but treating
+// an authenticated frontend as fully trusted means any XSS or admin-
+// CSRF leak gives the attacker LAN-pivot for free. Defence in depth:
+//
+//   1. Schema allowlist: http: and https: only. Strips file:, ftp:,
+//      gopher:, data:, javascript: etc. that ky would otherwise honour.
+//   2. Host-resolve allowlist: reject private IPv4 ranges (RFC1918,
+//      loopback, link-local, IPv4-mapped IPv6). Done by a synchronous
+//      check on the parsed hostname; we don't resolve DNS to keep the
+//      check fast and simple, but we DO block raw IP literals.
+//   3. Hard timeout (10s) + max-content-length (5 MB) — RSS feeds are
+//      small text, anything bigger is either misconfigured or hostile.
+const PRIVATE_IP_REGEXES = [
+  /^127\./,
+  /^10\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[0-1])\./, // 172.16.0.0/12
+  /^169\.254\./, // link-local
+  /^0\./,
+  /^::1$/,
+  /^::ffff:127\./i,
+  /^fe80:/i, // IPv6 link-local
+  /^fc00:/i, // IPv6 unique local
+  /^fd00:/i,
+]
+const isPrivateHost = (host: string): boolean => {
+  // Strip brackets from IPv6 literals
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase()
+  if (h === 'localhost' || h === '0.0.0.0' || h === '::') return true
+  return PRIVATE_IP_REGEXES.some((r) => r.test(h))
+}
+
 // Routes
 app.get('/api/rssfeed', async (req, res) => {
   const rssUrl = req.query.url
@@ -146,9 +186,59 @@ app.get('/api/rssfeed', async (req, res) => {
     res.status(500).send('Given url is not a string.')
     return
   }
-  ky.get(rssUrl)
+  let parsed: URL
+  try {
+    parsed = new URL(rssUrl)
+  } catch {
+    res.status(400).send('Invalid URL')
+    return
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    res.status(400).send('Only http(s) URLs are allowed')
+    return
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    res.status(403).send('Private / loopback hosts are not allowed')
+    return
+  }
+  // Defence-in-depth: probe with HEAD before the full GET.
+  // Without this, calling /api/rssfeed with a non-RSS URL (e.g. a multi-MB
+  // MP3 episode link as the frontend's RSS-resume code briefly did) streamed
+  // the entire binary body into memory before the 5MB body-cap aborted with
+  // 413 — ~4s wasted per request. HEAD lets us reject by content-type or
+  // advertised content-length in <500ms.
+  // Native fetch (not ky) — ky was silently failing on the 301-redirect
+  // chain in this codepath. HEAD is best-effort: some origin servers
+  // reject HEAD with 405/501. On non-2xx or network error during HEAD we
+  // fall through to the existing GET path; the 10s timeout + 5MB body
+  // cap still bound the worst case.
+  try {
+    const head = await fetch(rssUrl, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5000),
+    })
+    const ct = head.headers.get('content-type') || ''
+    if (ct && !/xml|rss/i.test(ct)) {
+      res.status(415).send(`Unsupported content-type: ${ct}`)
+      return
+    }
+    const cl = Number.parseInt(head.headers.get('content-length') || '0', 10)
+    if (cl > 5_000_000) {
+      res.status(413).send('Response too large (per content-length)')
+      return
+    }
+  } catch {
+    // HEAD failed — fall through to GET.
+  }
+  ky.get(rssUrl, { timeout: 10000 })
     .text()
     .then((response) => {
+      // Bound the parsed payload size — RSS feeds shouldn't be megabytes.
+      if (response.length > 5_000_000) {
+        res.status(413).send('Response too large')
+        return
+      }
       res.send(xmlparser.xml2json(response, { compact: true, nativeType: true }))
     })
     .catch(() => {
@@ -186,6 +276,7 @@ app.get('/api/resume', (_req, res) => {
   }
   tryReadFile(resumeFile)
     .then((data) => {
+      if (Array.isArray(data)) backfillLastPlayedAt(data, Date.now())
       res.json(data)
     })
     .catch((error) => {
@@ -214,6 +305,189 @@ app.get('/api/mupihat', (_req, res) => {
   })
 })
 
+// Playback time tracking written by backend-player to /tmp/playtime.json (tmpfs).
+// Missing/unreadable file means the player hasn't ticked yet or the feature is off —
+// either way, surfaces as "disabled" so the frontend can hide the UI safely.
+app.get('/api/playtime', (_req, res) => {
+  const disabled: PlaytimeStatus = { enabled: false }
+  if (!fs.existsSync(playtimeFile)) {
+    res.json(disabled)
+    return
+  }
+  jsonfile.readFile(playtimeFile, (error, data) => {
+    if (error) {
+      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] Error /api/playtime read playtime.json`)
+      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] ${error}`)
+      res.json(disabled)
+    } else {
+      res.json(data)
+    }
+  })
+})
+
+// Atomically apply a mutation to /etc/mupibox/mupiboxconfig.json.
+// Used by the parent-control endpoints below (extend / release / quietnow).
+// The player picks up the change ~50 ms later via fs.watch (see spotify-control.js).
+async function updateMupiboxConfig(mutate: (cfg: Record<string, unknown>) => void): Promise<void> {
+  const current = (await readJsonFile(mupiboxConfigPath)) as Record<string, unknown>
+  mutate(current)
+  const tmpPath = '/tmp/.mupiboxconfig.update.json'
+  await new Promise<void>((resolve, reject) => {
+    jsonfile.writeFile(tmpPath, current, { spaces: 2 }, (err) => (err ? reject(err) : resolve()))
+  })
+  await new Promise<void>((resolve, reject) => {
+    // sudo cp is allowed for the dietpi user on the box (same pattern as
+    // /api/shutdown / /api/reboot below). Atomic: write to a tmp on the same
+    // filesystem region, then cp into place; player's fs.watch fires once.
+    exec(`sudo cp ${tmpPath} ${mupiboxConfigPath} && sudo rm -f ${tmpPath}`, (err) => (err ? reject(err) : resolve()))
+  })
+  // Local cache invalidation (server's own mupiboxConfigCache) — fs.watch on the
+  // dir already does this, but be explicit so /api/config returns the new value
+  // immediately on the next call.
+  mupiboxConfigCache = undefined
+}
+
+// Logical-day computation must match the player's `getLogicalDay` so `todayBonus`
+// works consistently across processes (resetHour shifts when "today" begins).
+function computeLogicalDate(now: Date, resetHour: number): string {
+  const shifted = new Date(now.getTime() - resetHour * 3600 * 1000)
+  const y = shifted.getFullYear()
+  const m = String(shifted.getMonth() + 1).padStart(2, '0')
+  const d = String(shifted.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+// POST /api/playtime/extend  body: { minutes: number }
+// Adds bonus minutes to today's playtime cap. If the day rolls over at the
+// configured resetHour, the bonus auto-clears (player checks the date field).
+// Calling extend repeatedly accumulates: existing bonus for today is kept and
+// added to. Always uses the *current* day at the time of call, so e.g. an
+// /extend at 23:30 with resetHour=4 still applies to "today" until 04:00.
+app.post('/api/playtime/extend', async (req, res) => {
+  const minutes = Number(req.body?.minutes)
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) {
+    res.status(400).json({ error: 'minutes must be a positive number <= 1440' })
+    return
+  }
+  try {
+    await updateMupiboxConfig((cfg) => {
+      let pl = cfg.playtimeLimit as Record<string, unknown> | undefined
+      if (!pl || typeof pl !== 'object') {
+        pl = {}
+        cfg.playtimeLimit = pl
+      }
+      const resetHour = Number.isInteger(pl.resetHour) ? (pl.resetHour as number) : 0
+      const today = computeLogicalDate(new Date(), resetHour)
+      const existing = (pl.todayBonus as { date?: string; minutes?: number } | undefined) || {}
+      const existingMinutes =
+        existing.date === today && Number.isFinite(existing.minutes) ? Number(existing.minutes) : 0
+      pl.todayBonus = { date: today, minutes: Math.min(1440, existingMinutes + minutes) }
+    })
+    console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/playtime/extend +${minutes} min`)
+    res.status(200).json({ ok: true, addedMinutes: minutes })
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/playtime/extend failed:`, err)
+    res.status(500).json({ error: 'internal error' })
+  }
+})
+
+// POST /api/playtime/release  body: { minutes?: number }
+// Sets `playbackOverride.allowUntil = now + minutes*60_000`. While that timestamp
+// is in the future, all blocks are bypassed. Default 60 min if not specified.
+app.post('/api/playtime/release', async (req, res) => {
+  const minutes = req.body?.minutes !== undefined ? Number(req.body.minutes) : 60
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) {
+    res.status(400).json({ error: 'minutes must be a positive number <= 1440' })
+    return
+  }
+  const until = Date.now() + minutes * 60_000
+  try {
+    await updateMupiboxConfig((cfg) => {
+      let ov = cfg.playbackOverride as Record<string, unknown> | undefined
+      if (!ov || typeof ov !== 'object') {
+        ov = {}
+        cfg.playbackOverride = ov
+      }
+      ov.allowUntil = until
+    })
+    console.log(
+      `${new Date().toLocaleString()}: [MuPiBox-Server] /api/playtime/release for ${minutes} min (until ${new Date(until).toLocaleString()})`,
+    )
+    res.status(200).json({ ok: true, minutes, until })
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/playtime/release failed:`, err)
+    res.status(500).json({ error: 'internal error' })
+  }
+})
+
+// POST /api/playtime/limit  body: { day: 'mon'|...|'sun', minutes: number }
+// Sets the daily playtime cap for one weekday in mupiboxconfig.json. Used by
+// the Telegram /limit set bot command so parents can adjust a single day
+// without opening the admin UI. Live-reload in the player picks the change up
+// within ~50 ms; no restart needed.
+const PLAYTIME_DAY_KEYS = new Set(['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'])
+app.post('/api/playtime/limit', async (req, res) => {
+  const day = String(req.body?.day || '').toLowerCase()
+  const minutes = Number(req.body?.minutes)
+  if (!PLAYTIME_DAY_KEYS.has(day)) {
+    res.status(400).json({ error: 'day must be one of mon|tue|wed|thu|fri|sat|sun' })
+    return
+  }
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes > 1440) {
+    res.status(400).json({ error: 'minutes must be in [0, 1440]' })
+    return
+  }
+  try {
+    await updateMupiboxConfig((cfg) => {
+      let pl = cfg.playtimeLimit as Record<string, unknown> | undefined
+      if (!pl || typeof pl !== 'object') {
+        pl = {}
+        cfg.playtimeLimit = pl
+      }
+      let limits = pl.limitsMinutes as Record<string, unknown> | undefined
+      if (!limits || typeof limits !== 'object') {
+        limits = {}
+        pl.limitsMinutes = limits
+      }
+      limits[day] = minutes
+    })
+    console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/playtime/limit ${day}=${minutes} min`)
+    res.status(200).json({ ok: true, day, minutes })
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/playtime/limit failed:`, err)
+    res.status(500).json({ error: 'internal error' })
+  }
+})
+
+// POST /api/quiethours/now  body: { minutes?: number }
+// Sets `playbackOverride.forceBlockUntil = now + minutes*60_000`. Forces playback
+// off immediately (kid sees the override overlay). Default 60 min.
+app.post('/api/quiethours/now', async (req, res) => {
+  const minutes = req.body?.minutes !== undefined ? Number(req.body.minutes) : 60
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 1440) {
+    res.status(400).json({ error: 'minutes must be a positive number <= 1440' })
+    return
+  }
+  const until = Date.now() + minutes * 60_000
+  try {
+    await updateMupiboxConfig((cfg) => {
+      let ov = cfg.playbackOverride as Record<string, unknown> | undefined
+      if (!ov || typeof ov !== 'object') {
+        ov = {}
+        cfg.playbackOverride = ov
+      }
+      ov.forceBlockUntil = until
+    })
+    console.log(
+      `${new Date().toLocaleString()}: [MuPiBox-Server] /api/quiethours/now for ${minutes} min (until ${new Date(until).toLocaleString()})`,
+    )
+    res.status(200).json({ ok: true, minutes, until })
+  } catch (err) {
+    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/quiethours/now failed:`, err)
+    res.status(500).json({ error: 'internal error' })
+  }
+})
+
 app.get('/api/activeresume', (_req, res) => {
   // active_resume.json is a symlink that scripts/mupibox/check_network.sh
   // creates the first time the network state is determined. Until that runs
@@ -229,6 +503,12 @@ app.get('/api/activeresume', (_req, res) => {
       console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] ${error}`)
       res.json([])
     } else {
+      // Lazy back-fill in-memory: legacy entries written before the
+      // lastPlayedAt field gain synthetic stamps so frontend's DESC sort
+      // produces the same visible order as the old blind .reverse() until
+      // a real save persists a fresh stamp. No write here — file gets the
+      // back-fill on the next /api/addresume call.
+      if (Array.isArray(data)) backfillLastPlayedAt(data, Date.now())
       res.json(data)
     }
   })
@@ -446,6 +726,65 @@ const resumeKeyOf = (m: { type?: string; id?: string; playlistid?: string; showi
     m?.playlistid || m?.showid || m?.audiobookid || m?.id || `${m?.artist || ''}::${m?.title || ''}`,
   ].join('|')
 
+// AR5-18: when mplayer fires playlist-finish, backend-player POSTs
+// /api/deleteresume to remove the now-completed album from the resume list.
+// At the same instant the frontend's player page notices the playback ended
+// and POSTs /api/addresume to save "where we last were". The file lock here
+// serialises the two writes, but the order is non-deterministic: if
+// addresume wins after deleteresume, the resume entry gets resurrected and
+// the kid is offered "weiterhören" at the very last second of an album that
+// just finished — defeating the whole point of deleteresume on playlist-end.
+//
+// Mitigation: track recently-deleted composite keys for a short rejection
+// window. While a key is in this map, an addresume for that key is silently
+// skipped (still 200 ok). 2.5s comfortably covers the worst case: mplayer
+// playlist-finish → backend-player HTTP → /api/deleteresume → frontend
+// observes paused state → /api/addresume, with SD-induced delays.
+const RESUME_REJECT_AFTER_DELETE_MS = 2500
+const recentResumeDeletes = new Map<string, number>()
+const noteResumeDeleted = (key: string) => {
+  recentResumeDeletes.set(key, Date.now())
+}
+const wasResumeJustDeleted = (key: string): boolean => {
+  const stamp = recentResumeDeletes.get(key)
+  if (stamp === undefined) return false
+  if (Date.now() - stamp > RESUME_REJECT_AFTER_DELETE_MS) {
+    recentResumeDeletes.delete(key)
+    return false
+  }
+  return true
+}
+// Tidy the map every minute so a long-running backend doesn't accumulate
+// keys forever. Lookups already self-expire, but stale entries hold memory
+// until they're looked up — a periodic sweep bounds the worst case.
+setInterval(() => {
+  const cutoff = Date.now() - RESUME_REJECT_AFTER_DELETE_MS
+  for (const [k, t] of recentResumeDeletes) {
+    if (t < cutoff) recentResumeDeletes.delete(k)
+  }
+}, 60_000).unref?.()
+
+// Back-fill lastPlayedAt for legacy resume entries that pre-date the field.
+// Reasoning: the previous addresume implementation did update-in-place when
+// an entry already existed, so an item the user was actively replaying
+// stayed at its original index — and idx 0 typically holds the item that
+// was last replayed in-place. Set synthetic stamps so idx 0 gets the
+// LARGEST stamp (most-recently-updated) and idx N the smallest. After
+// frontend's DESC sort that places the user's last-replayed item at
+// position 1 (left). Real saves use Date.now(), which is always larger
+// than these synthetic stamps, so a fresh playback always wins.
+// Idempotent: no-ops once every entry has a numeric stamp.
+function backfillLastPlayedAt(data: any[], now: number): void {
+  const baseTime = now - data.length * 1000 - 60000
+  const lastIdx = data.length - 1
+  data.forEach((entry: any, idx: number) => {
+    if (typeof entry.lastPlayedAt !== 'number') {
+      // Invert: idx 0 → largest stamp (lastIdx ms), idx N → smallest.
+      entry.lastPlayedAt = baseTime + (lastIdx - idx)
+    }
+  })
+}
+
 // Resilient resume.json reader. ENOENT (fresh box, file not yet created) and
 // JSON parse errors both used to leave the endpoint stuck — every save would
 // 200 "error" until somebody manually fixed the file. Now: missing file is
@@ -493,13 +832,30 @@ app.post('/api/addresume', (req, res) => {
     return
   }
   readResumeOrRecover('/api/addresume', (data) => {
+    const now = Date.now()
     const incomingKey = resumeKeyOf(req.body)
+    // AR5-18: if backend-player just told us this album finished naturally
+    // (POST /api/deleteresume within the last RESUME_REJECT_AFTER_DELETE_MS),
+    // refuse to recreate the entry that the frontend's paused-state observer
+    // is now racing to save. Respond ok so the frontend doesn't treat the
+    // skip as a failure.
+    if (wasResumeJustDeleted(incomingKey)) {
+      releaseLock(resumeLock, '/api/addresume')
+      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/addresume skipped (key=${incomingKey} was just deleted on playlist-finish).`)
+      res.status(200).send('ok')
+      return
+    }
+    backfillLastPlayedAt(data, now)
+    // Always stamp the incoming entry — it was just played now, so it
+    // should sort to position 1 on the resume page after frontend's
+    // DESC sort by lastPlayedAt.
+    const incoming = { ...req.body, lastPlayedAt: now }
     const index = data.findIndex((item: any) => resumeKeyOf(item) === incomingKey)
     if (index !== -1) {
-      data[index] = req.body
+      data[index] = incoming
       console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] Resume entry replaced (key=${incomingKey}).`)
     } else {
-      data.push(req.body)
+      data.push(incoming)
       console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] Resume entry added (key=${incomingKey}).`)
     }
     jsonfile.writeFile(resumeFile, data, { spaces: 4 }, (writeError) => {
@@ -533,6 +889,10 @@ app.post('/api/deleteresume', (req, res) => {
   }
   readResumeOrRecover('/api/deleteresume', (data) => {
     const targetKey = resumeKeyOf(req.body)
+    // AR5-18: even if no entry matched (idempotent path), still mark the
+    // key as recently-deleted. The race window covers the frontend's
+    // pending addresume regardless of whether anything was on disk yet.
+    noteResumeDeleted(targetKey)
     const remaining = data.filter((item: any) => resumeKeyOf(item) !== targetKey)
     if (remaining.length === data.length) {
       releaseLock(resumeLock, '/api/deleteresume')
@@ -611,49 +971,6 @@ app.post('/api/edit', (req, res) => {
       releaseLock(dataLock, '/api/edit')
       if (writeError) {
         console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/edit write failed:`, writeError)
-        res.status(500).send('error')
-        return
-      }
-      res.status(200).send('ok')
-    })
-  })
-})
-
-app.post('/api/editresume', (req, res) => {
-  if (fs.existsSync(resumeLock)) {
-    console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/editresume resume.json is locked`)
-    res.status(200).send('locked')
-    return
-  }
-  try {
-    fs.openSync(resumeLock, 'w')
-  } catch (err) {
-    console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/editresume failed to acquire lock:`, err)
-    res.status(200).send('error')
-    return
-  }
-  readResumeOrRecover('/api/editresume', (data) => {
-    const incomingKey = resumeKeyOf(req.body.data)
-    const existingIndex = data.findIndex((item: any) => resumeKeyOf(item) === incomingKey)
-    if (existingIndex !== -1) {
-      data[existingIndex] = req.body.data
-      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] Resume entry replaced (key=${incomingKey}).`)
-    } else if (Number.isInteger(req.body.index) && req.body.index >= 0 && data.length > 0) {
-      // Frontend uses index=99 as a sentinel for "just added, dunno actual index";
-      // with the composite-key match above, that path now finds the real entry.
-      // Fall back to splice only if the caller really gave us a valid index — and
-      // never on an empty array.
-      const indexToReplace = Math.min(req.body.index, data.length - 1)
-      data.splice(indexToReplace, 1, req.body.data)
-      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] Resume entry replaced at index ${indexToReplace} (no key match).`)
-    } else {
-      data.push(req.body.data)
-      console.log(`${new Date().toLocaleString()}: [MuPiBox-Server] Resume entry appended (no key match, no usable index, key=${incomingKey}).`)
-    }
-    jsonfile.writeFile(resumeFile, data, { spaces: 4 }, (writeError) => {
-      releaseLock(resumeLock, '/api/editresume')
-      if (writeError) {
-        console.error(`${new Date().toLocaleString()}: [MuPiBox-Server] /api/editresume write failed:`, writeError)
         res.status(500).send('error')
         return
       }
