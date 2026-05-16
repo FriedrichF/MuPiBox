@@ -330,7 +330,7 @@ class bq25792:
             self.VREG = self._value * 10
         def set (self, value):
             super().set(value)
-            self.VRE0G = self._value * 10
+            self.VREG = self._value * 10
 
     class REG03_Charge_Current_Limit(BQ25795_REGISTER):
         #Charge Current Limit During POR, the device reads the resistance tie to PROG pin, to identify the default battery cell count and determine the default power-on battery charging current: 1s and 2s: 3s and 4s: 1A Type : RW Range : 50mA-5000mA Fixed Offset : 0mA Bit Step Size : 10mA
