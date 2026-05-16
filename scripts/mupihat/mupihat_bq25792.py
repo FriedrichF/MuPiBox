@@ -263,7 +263,7 @@ class bq25792:
         elif VBat > v_75    : Bat_SOC = "75%"
         elif VBat > v_50    : Bat_SOC = "50%"
         elif VBat > v_25    : Bat_SOC = "25%"
-        elif VBat > v_0     : Bat_SOC = "0%"
+        else                : Bat_SOC = "0%"
 
         if VBat > th_warning : Bat_Stat = 'OK'
         elif (VBat < th_warning) & (VBat > th_shutdown) : Bat_Stat = 'LOW'
