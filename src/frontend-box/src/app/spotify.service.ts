@@ -107,16 +107,21 @@ export class SpotifyService {
     // First, get the total count and then fetch all pages
     return fetchPage(0).pipe(
       switchMap((firstPageResponse) => {
-        const { items: firstPageItems, total } = firstPageResponse
+        const { items: firstPageItems, total, limit: actualLimit } = firstPageResponse
 
         // If we have all results in the first page, return them
         if (firstPageItems.length >= total) {
           return of(firstPageItems)
         }
 
+        // Use the limit the backend actually used — not the requested pageSize.
+        // If the backend caps at a smaller value (e.g. 10 instead of 50),
+        // calculating offsets from pageSize would skip items.
+        const effectivePageSize = actualLimit || firstPageItems.length || pageSize
+
         // Calculate how many more pages we need
         const remainingItems = total - firstPageItems.length
-        const additionalPagesNeeded = Math.ceil(remainingItems / pageSize)
+        const additionalPagesNeeded = Math.ceil(remainingItems / effectivePageSize)
 
         if (additionalPagesNeeded <= 0) {
           return of(firstPageItems)
@@ -125,7 +130,7 @@ export class SpotifyService {
         // Create observables for additional pages
         const additionalPageObservables: Observable<T[]>[] = []
         for (let page = 1; page <= additionalPagesNeeded; page++) {
-          const offset = page * pageSize
+          const offset = page * effectivePageSize
           additionalPageObservables.push(
             fetchPage(offset).pipe(
               map((response) => response.items),

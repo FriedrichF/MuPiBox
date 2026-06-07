@@ -364,16 +364,16 @@ export class SpotifyApiService {
     const cacheKey = `search_albums_${query}_${limit}_${offset}`
 
     return this.executeWithCache(cacheKey, async () => {
-      const result = await this.spotifyApi.search(query, ['album'], 'DE', Math.min(limit, 10) as any, offset)
+      const result = await this.spotifyApi.search(query, ['album'], 'DE', Math.min(limit, 50) as any, offset)
       return {
         items:
-          result.albums.items.map((item) => ({
+          (result.albums.items || []).filter((item) => item != null).map((item) => ({
             id: item.id,
             name: item.name,
             artists: item.artists,
             images: item.images,
             release_date: item.release_date,
-          })) || [],
+          })),
         total: result.albums.total || 0,
         limit: result.albums.limit || limit,
         offset: result.albums.offset || offset,
@@ -394,11 +394,11 @@ export class SpotifyApiService {
         artistId,
         'album,single,compilation',
         'DE',
-        Math.min(limit, 10) as any,
+        Math.min(limit, 50) as any,
         offset,
       )
       return {
-        items: (result.items || []).map((item: any) => ({
+        items: (result.items || []).filter((item: any) => item != null).map((item: any) => ({
           id: item.id,
           name: item.name,
           artists: item.artists,
@@ -420,9 +420,9 @@ export class SpotifyApiService {
     const cacheKey = `show_episodes_${showId}_${limit}_${offset}`
 
     return this.executeWithCache(cacheKey, async () => {
-      const result = await this.spotifyApi.shows.episodes(showId, 'DE', Math.min(limit, 10) as any, offset)
+      const result = await this.spotifyApi.shows.episodes(showId, 'DE', Math.min(limit, 50) as any, offset)
       return {
-        items: result.items.map((item) => ({
+        items: (result.items || []).filter((item) => item != null).map((item) => ({
           id: item.id,
           name: item.name,
           images: item.images,
@@ -483,10 +483,10 @@ export class SpotifyApiService {
           playlistId,
           'DE',
           'items(track(id,uri,name))',
-          Math.min(limit, 10) as any,
+          Math.min(limit, 50) as any,
           offset,
         )
-        return result.items
+        return (result.items || []).filter((item) => item != null)
       },
       forceBackgroundRefresh,
     )
