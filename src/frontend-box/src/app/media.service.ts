@@ -1,7 +1,7 @@
 import { HttpClient } from '@angular/common/http'
 import { Injectable } from '@angular/core'
 import { firstValueFrom, from, iif, interval, Observable, of, Subject } from 'rxjs'
-import { map, mergeAll, mergeMap, shareReplay, switchMap, toArray } from 'rxjs/operators'
+import { map, mergeMap, shareReplay, switchMap, toArray } from 'rxjs/operators'
 import { environment } from '../environments/environment'
 import type { AlbumStop } from './albumstop'
 import type { Artist } from './artist'
@@ -564,8 +564,8 @@ export class MediaService {
             ),
           ),
       ),
-      mergeMap((items) => from(items)), // seperate arrays to single observables
-      mergeAll(), // merge everything together
+      mergeMap((obs) => obs, 4), // at most 4 items loading concurrently
+      mergeMap((items) => from(items)), // flatten Media[] to individual Media items
       toArray(), // convert to array
       map((media) => {
         // add dummy image for missing covers

@@ -8,25 +8,50 @@ const parsers = require('./parsers')
 
 const createPlayer = () => {
   const out = new EventEmitter()
+  let proc = null
+  let intendedClose = false
 
-  const proc = spawn(
-    'mplayer',
-    [
-      '-slave', // 😔
-      '-idle',
-      '-novideo',
-      '-quiet',
-      '-msglevel',
-      'all=1:global=4:cplayer=4',
-    ],
-    {
+  const onLine = (line) => {
+    debug(`line: ${line}`)
+    if (line === 'Starting playback...') return out.emit('track-change')
+
+    if (line === 'ANS_ERROR=PROPERTY_UNAVAILABLE') return out.emit('playlist-finish')
+
+    const parts = /^ANS_([\w]+)=/g.exec(line)
+    if (!parts || !parts[1]) return null
+    const prop = parts[1]
+
+    const parser = parsers[prop]
+    if (!parser) return null
+    const val = parser(line.slice(parts[0].length))
+    out.emit('prop', prop, val)
+    out.emit(prop, val)
+  }
+
+  const startMplayer = () => {
+    proc = spawn('mplayer', ['-slave', '-idle', '-novideo', '-quiet', '-msglevel', 'all=1:global=4:cplayer=4'], {
       env: process.env,
       stdio: ['pipe', 'pipe', 'ignore'],
-    },
-  )
+    })
+
+    proc.stdout.pipe(byLine.createStream()).on('data', (line) => {
+      onLine(Buffer.isBuffer(line) ? line.toString() : line)
+    })
+
+    proc.on('close', (code) => {
+      if (intendedClose) {
+        out.emit('close', code)
+        return
+      }
+      // Unexpected exit — restart mplayer automatically
+      console.error(`[mplayer-wrapper] mplayer exited unexpectedly (code ${code}), restarting in 2s`)
+      setTimeout(startMplayer, 2000)
+    })
+  }
 
   // wrapper -> mplayer
   const exec = (cmd, args = []) => {
+    if (!proc || intendedClose) return
     let str = cmd
     for (const arg of args) {
       str += ' '
@@ -38,8 +63,13 @@ const createPlayer = () => {
     }
     str = decodeURIComponent(str)
     debug(`exec: ${str}`)
-    proc.stdin.write(`${str}\n`)
+    try {
+      proc.stdin.write(`${str}\n`)
+    } catch (err) {
+      console.error('[mplayer-wrapper] Failed to write to mplayer stdin:', err.message)
+    }
   }
+
   const getProps = (props) => {
     for (const prop of props) exec('pausing_keep_force get_property', [prop])
   }
@@ -55,41 +85,14 @@ const createPlayer = () => {
   const setVolume = (amount) => exec('pausing_keep volume', [amount, '1'])
   const stop = () => exec('stop')
 
-  let closed = false
-  proc.on('close', (code) => {
-    closed = true
-    out.emit('close', code)
-    if (code > 0) {
-      // todo: emit err from proc.stderr
-    }
-  })
   const close = () => {
-    if (!closed) exec('quit')
+    if (!intendedClose) {
+      intendedClose = true
+      exec('quit')
+    }
   }
 
-  // mplayer -> wrapper
-  const onLine = (line) => {
-    debug(`line: ${line}`)
-    if (line === 'Starting playback...') return out.emit('track-change')
-
-    //Callback when playlist finishes
-    if (line === 'ANS_ERROR=PROPERTY_UNAVAILABLE') return out.emit('playlist-finish')
-    // todo: `ANS_ERROR=PROPERTY_UNAVAILABLE`
-
-    const parts = /^ANS_([\w]+)=/g.exec(line)
-    if (!parts || !parts[1]) return null
-    const prop = parts[1]
-
-    const parser = parsers[prop]
-    if (!parser) return null
-    const val = parser(line.slice(parts[0].length))
-    out.emit('prop', prop, val)
-    out.emit(prop, val)
-  }
-
-  proc.stdout.pipe(byLine.createStream()).on('data', (line) => {
-    onLine(Buffer.isBuffer(line) ? line.toString() : line)
-  })
+  startMplayer()
 
   out.exec = exec
   out.getProps = getProps

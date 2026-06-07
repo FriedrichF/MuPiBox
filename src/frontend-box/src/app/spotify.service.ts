@@ -98,7 +98,7 @@ export class SpotifyService {
   /**
    * Helper method to fetch all paginated results from the backend API using total count
    */
-  private fetchAllPaginatedResults<T>(url: string, baseParams: any, pageSize = 10): Observable<T[]> {
+  private fetchAllPaginatedResults<T>(url: string, baseParams: any, pageSize = 50): Observable<T[]> {
     const fetchPage = (offset: number): Observable<{ items: T[]; total: number; limit: number; offset: number }> => {
       const params = { ...baseParams, limit: pageSize.toString(), offset: offset.toString() }
       return this.http.get<{ items: T[]; total: number; limit: number; offset: number }>(url, { params })

@@ -23,6 +23,14 @@ if (process.env.NODE_ENV === 'development') {
 const muPiBoxConfig = require(`${configBasePath}/mupiboxconfig.json`)
 const config = require(`${configBasePath}/config.json`)
 
+// Last-resort handlers — keep the process alive even on unexpected errors
+process.on('uncaughtException', (err) => {
+  console.error(`[spotify-control] Uncaught exception: ${err}`)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error(`[spotify-control] Unhandled rejection: ${reason}`)
+})
+
 const log = require('console-log-level')({ level: config.server.logLevel })
 
 /*set up express router and set headers for cross origin requests*/
@@ -45,8 +53,13 @@ const spotifyApi = new SpotifyWebApi({
 })
 
 /* sets and refreshes access token every hour */
-refreshToken()
-setInterval(refreshToken, 1000 * 60 * 60)
+refreshToken().catch((err) => log.debug(`${nowDate.toLocaleString()}: Initial token refresh failed: ${err}`))
+setInterval(
+  () => {
+    refreshToken().catch((err) => log.debug(`${nowDate.toLocaleString()}: Token refresh failed: ${err}`))
+  },
+  1000 * 60 * 60,
+)
 
 const apiAccessToken = {
   accessToken: null,
@@ -127,11 +140,10 @@ setInterval(() => {
   const exec = require('node:child_process').exec
   exec(cmdVolume, (e, stdout, _stderr) => {
     if (e instanceof Error) {
-      // TODO: Get this to run in development.
-      if (process.env.NODE_ENV === 'development') {
-        return
+      if (process.env.NODE_ENV !== 'development') {
+        console.error(`[spotify-control] amixer volume read failed: ${e.message}`)
       }
-      throw e
+      return
     }
     currentMeta.volume = Number.parseInt(stdout.split('[')[1].split('%')[0], 10)
   })
@@ -261,7 +273,11 @@ function setAccessToken(token) {
 /*called in all error cases*/
 /*token expired and no_device error are handled explicitly*/
 function handleSpotifyError(err, from) {
-  if (err.body.error?.status === 401) {
+  // Guard: network errors may have no body — avoid crashing here
+  const status = err?.body?.error?.status
+  const errStr = err?.toString() ?? ''
+
+  if (status === 401) {
     log.debug(`${nowDate.toLocaleString()}: access token expired, refreshing...`)
     log.debug(`${nowDate.toLocaleString()}: Error from: ${from}`)
     counter.counterrorAccessToken++
@@ -269,9 +285,9 @@ function handleSpotifyError(err, from) {
       writeCounter()
     }
     if (currentMeta.activeSpotifyId !== '0') {
-      refreshToken()
+      refreshToken().catch((e) => log.debug(`${nowDate.toLocaleString()}: Token refresh failed: ${e}`))
     }
-  } else if (err.body.error?.status === 400) {
+  } else if (status === 400) {
     log.debug(`${nowDate.toLocaleString()}: invalid id`)
     log.debug(`${nowDate.toLocaleString()}: Error from: ${from}`)
     log.debug(`${nowDate.toLocaleString()}: ${err}`)
@@ -282,7 +298,7 @@ function handleSpotifyError(err, from) {
     if (currentMeta.activeSpotifyId !== '0') {
       setActiveDevice()
     }
-  } else if (err.body.error?.status === 429) {
+  } else if (status === 429) {
     log.debug(`${nowDate.toLocaleString()}: To many requests on th spotify web api`)
     log.debug(`${nowDate.toLocaleString()}: Error from: ${from}`)
     log.debug(`${nowDate.toLocaleString()}: ${err}`)
@@ -290,10 +306,7 @@ function handleSpotifyError(err, from) {
     if (config.server.logLevel === 'debug') {
       writeCounter()
     }
-    //setTimeout(function(){
-    //
-    //},2000)
-  } else if (err.toString().includes('NO_ACTIVE_DEVICE')) {
+  } else if (errStr.includes('NO_ACTIVE_DEVICE')) {
     log.debug(`${nowDate.toLocaleString()}: no active device, setting the first one found to active`)
     log.debug(`${nowDate.toLocaleString()}: Error from: ${from}`)
     log.debug(`${nowDate.toLocaleString()}: playID: ${currentMeta.activeSpotifyId}`)
@@ -304,7 +317,7 @@ function handleSpotifyError(err, from) {
     if (currentMeta.activeSpotifyId !== '0') {
       setActiveDevice()
     }
-  } else if (err.toString().includes('Device not found')) {
+  } else if (errStr.includes('Device not found')) {
     log.debug(`${nowDate.toLocaleString()}: Device not found: ${err}`)
     log.debug(`${nowDate.toLocaleString()}: ${err}`)
     log.debug(`${nowDate.toLocaleString()}: Error from: ${from}`)
@@ -585,13 +598,13 @@ function shuffleoff() {
 
 function playMe() {
   log.debug(`${nowDate.toLocaleString()}: [Spotify Control] Spotify play ${currentMeta.activeSpotifyId}`)
-  resumeOffset = currentMeta.activeSpotifyId.split(':')[3]
+  let resumeOffset = currentMeta.activeSpotifyId.split(':')[3]
   log.debug(`${nowDate.toLocaleString()}: [Spotify Control] Spotify resume ${resumeOffset}`)
   if (resumeOffset > 0) resumeOffset--
   log.debug(`${nowDate.toLocaleString()}: [Spotify Control] Spotify offset ${resumeOffset}`)
-  resumeProgess = currentMeta.activeSpotifyId.split(':')[4]
-  tmp = currentMeta.activeSpotifyId.split(':')
-  contextUri = `${tmp[0]}:${tmp[1]}:${tmp[2]}`
+  const resumeProgess = currentMeta.activeSpotifyId.split(':')[4]
+  const tmp = currentMeta.activeSpotifyId.split(':')
+  const contextUri = `${tmp[0]}:${tmp[1]}:${tmp[2]}`
 
   // Prepare play options with device_id if available
   const playOptions = {
@@ -700,8 +713,8 @@ function playList(playedList) {
     const exec = require('node:child_process').exec
     exec(cmdtotalTracks, (e, stdout, stderr) => {
       if (e instanceof Error) {
-        console.error(e)
-        throw e
+        console.error(`[spotify-control] Track count failed: ${e.message}`)
+        return
       }
       currentMeta.totalTracks = Number.parseInt(stdout.split(/\r?\n/)[0], 10)
       console.log('stdout', stdout)
@@ -809,8 +822,8 @@ function deleteLocal(deleteFile) {
   const exec = require('node:child_process').exec
   exec(deleteCMD, (e, stdout, stderr) => {
     if (e instanceof Error) {
-      console.error(e)
-      throw e
+      console.error(`[spotify-control] Delete failed: ${e.message}`)
+      return
     }
     console.log('stdout', stdout)
     console.log('stderr', stderr)
@@ -847,8 +860,8 @@ async function setVolume(volume) {
   const exec = require('node:child_process').exec
   exec(cmdVolume, (e, stdout, _stderr) => {
     if (e instanceof Error) {
-      console.error(nowDate.toLocaleString() + e)
-      throw e
+      console.error(`[spotify-control] amixer setVolume read failed: ${e.message}`)
+      return
     }
     currentMeta.volume = Number.parseInt(stdout.split('[')[1].split('%')[0], 10)
     //console.log('stdout', stdout);
@@ -884,7 +897,7 @@ async function transferPlayback(id) {
     },
     (err) => {
       log.debug(`${nowDate.toLocaleString()}: [Spotify Control] Transfering playback error.`)
-      handleSpotifyError(err, id, 'transferPlayback')
+      handleSpotifyError(err, 'transferPlayback')
     },
   )
 }
